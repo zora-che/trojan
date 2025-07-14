@@ -1,10 +1,12 @@
 import pandas as pd
 import time
-from typing import Dict, List
+import json
+from typing import Dict, List, Tuple
 from tqdm import tqdm
 import sys
 import os
 import logging
+import argparse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12,21 +14,22 @@ logger = logging.getLogger(__name__)
 
 # Add the src directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from score import RefusalJudgeLLM
+from score import RefusalJudgeLLM, HarmJudgeLLM
 
-def analyze_refusals(csv_path: str, sample_size: int = None) -> Dict[str, Dict[str, float]]:
+def analyze_refusals(csv_path: str, sample_size: int = None) -> Tuple[Dict[str, Dict[str, float]], pd.DataFrame]:
     """
-    Analyze refusal rates in model response columns
+    Analyze refusal rates and harm scores in model response columns
     
     Args:
         csv_path: Path to the CSV file
         sample_size: If specified, analyze only a sample of rows
     
     Returns:
-        Dictionary with refusal statistics for each model
+        Tuple of (dictionary with refusal statistics for each model, updated dataframe with judge columns)
     """
-    # Initialize refusal judge
+    # Initialize both judges
     refusal_judge = RefusalJudgeLLM()
+    harm_judge = HarmJudgeLLM()
     
     # Read CSV
     logger.info(f"Loading CSV from {csv_path}...")
@@ -34,7 +37,7 @@ def analyze_refusals(csv_path: str, sample_size: int = None) -> Dict[str, Dict[s
     
     # Take sample if specified
     if sample_size:
-        df = df.sample(n=min(sample_size, len(df)), random_state=42)
+        df = df.sample(n=min(sample_size, len(df)), random_state=42).reset_index(drop=True)
         logger.info(f"Analyzing sample of {len(df)} rows")
     else:
         logger.info(f"Analyzing all {len(df)} rows")
@@ -48,48 +51,76 @@ def analyze_refusals(csv_path: str, sample_size: int = None) -> Dict[str, Dict[s
     for column in response_columns:
         logger.info(f"\nAnalyzing {column}...")
         
-        # Filter out empty responses
-        valid_responses = df[column].dropna()
-        valid_responses = valid_responses[valid_responses != '']
+        # Create judge column name
+        judge_column = f"{column}_JUDGE"
         
-        logger.info(f"Found {len(valid_responses)} valid responses")
+        # Initialize judge data for all rows
+        judge_data = [None] * len(df)
         
-        if len(valid_responses) == 0:
-            results[column] = {
-                'total_responses': 0,
-                'refusals': 0,
-                'refusal_rate': 0.0,
-                'non_refusals': 0
-            }
-            continue
-        
-        # Check refusals
+        # Check refusals and harm scores
         refusals = []
         non_refusals = []
         
         # Process responses one by one (following inference.py pattern)
-        for i, response in enumerate(tqdm(valid_responses, desc=f"Processing {column}")):
+        for idx in tqdm(df.index, desc=f"Processing {column}"):
+            response = df.loc[idx, column]
+            
+            # Skip empty responses
+            if pd.isna(response) or response == '':
+                judge_data[idx] = json.dumps({
+                    "refusal": False,
+                    "harm_score": 0,
+                    "explanation": "Empty response"
+                })
+                continue
+            
             try:
                 # Check if this is a refusal
-                is_refusal, explanation = refusal_judge.check_refusal(str(response))
+                is_refusal, refusal_explanation = refusal_judge.check_refusal(str(response))
                 
                 if is_refusal:
                     refusals.append(response)
-                    logger.debug(f"Row {i}: Refusal detected - {explanation[:100]}...")
+                    logger.debug(f"Row {idx}: Refusal detected - {refusal_explanation[:100]}...")
+                    
+                    # For refusals, don't run harm judge
+                    judge_data[idx] = json.dumps({
+                        "refusal": True,
+                        "harm_score": 0,
+                        "explanation": refusal_explanation
+                    })
                 else:
                     non_refusals.append(response)
-                    logger.debug(f"Row {i}: Non-refusal")
+                    logger.debug(f"Row {idx}: Non-refusal, checking harm...")
+                    
+                    # Run harm judge for non-refusals
+                    harm_score, harm_explanation = harm_judge.check_harm(str(response))
+                    
+                    judge_data[idx] = json.dumps({
+                        "refusal": False,
+                        "harm_score": harm_score,
+                        "explanation": harm_explanation
+                    })
                     
             except Exception as e:
-                logger.error(f"Row {i}: Error processing response: {str(e)}")
-                # Treat errors as non-refusals to be conservative
+                logger.error(f"Row {idx}: Error processing response: {str(e)}")
+                # Treat errors as non-refusals with low harm score
                 non_refusals.append(response)
+                judge_data[idx] = json.dumps({
+                    "refusal": False,
+                    "harm_score": 1,
+                    "explanation": f"Error during processing: {str(e)}"
+                })
             
             # Add a small delay to avoid rate limiting (like inference.py approach)
-            if i % 10 == 0 and i > 0:  # Every 10 requests
+            if idx % 10 == 0 and idx > 0:  # Every 10 requests
                 time.sleep(0.5)
         
+        # Add judge column to dataframe
+        df[judge_column] = judge_data
+        
         # Calculate statistics
+        valid_responses = df[column].dropna()
+        valid_responses = valid_responses[valid_responses != '']
         total_responses = len(valid_responses)
         num_refusals = len(refusals)
         num_non_refusals = len(non_refusals)
@@ -108,7 +139,7 @@ def analyze_refusals(csv_path: str, sample_size: int = None) -> Dict[str, Dict[s
         logger.info(f"  Non-refusals: {num_non_refusals}")
         logger.info(f"  Refusal rate: {refusal_rate:.3f} ({refusal_rate*100:.1f}%)")
     
-    return results
+    return results, df
 
 def print_summary(results: Dict[str, Dict[str, float]]):
     """Print a summary of refusal analysis results"""
@@ -128,20 +159,32 @@ def print_summary(results: Dict[str, Dict[str, float]]):
 
 def main():
     """Main function to run the refusal analysis"""
-    csv_path = "results/L12_july_9_responses.csv"
+    parser = argparse.ArgumentParser(description='Analyze refusal rates in model responses')
+    parser.add_argument('--csv-path', type=str, default="results/L12_july_9_responses.csv",
+                        help='Path to the CSV file to analyze')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Limit the number of rows to process (for testing)')
+    
+    args = parser.parse_args()
     
     # For initial testing, let's analyze a smaller sample
     # Remove sample_size parameter to analyze all rows
-    results = analyze_refusals(csv_path, sample_size=1000)
+    results, df_with_judges = analyze_refusals(args.csv_path, sample_size=args.limit)
     
     print_summary(results)
     
     # Save results to a file
-    import json
     with open("results/refusal_analysis_results.json", "w") as f:
         json.dump(results, f, indent=2)
     
     logger.info(f"\nResults saved to results/refusal_analysis_results.json")
+    
+    # Save the judged CSV
+    base_name = os.path.splitext(args.csv_path)[0]
+    judged_csv_path = f"{base_name}_judged.csv"
+    df_with_judges.to_csv(judged_csv_path, index=False)
+    
+    logger.info(f"Judged CSV saved to {judged_csv_path}")
 
 if __name__ == "__main__":
     main() 
